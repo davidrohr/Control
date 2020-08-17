@@ -26,12 +26,12 @@
 package core
 
 import (
-	"fmt"
-	"github.com/spf13/viper"
 	"runtime"
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/spf13/viper"
 
 	"github.com/AliceO2Group/Control/common/product"
 	"github.com/AliceO2Group/Control/core/task"
@@ -42,8 +42,6 @@ import (
 
 	"github.com/AliceO2Group/Control/core/environment"
 	"github.com/AliceO2Group/Control/core/protos"
-	"github.com/looplab/fsm"
-	"github.com/mesos/mesos-go/api/v1/lib/extras/store"
 	"github.com/pborman/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
@@ -51,11 +49,10 @@ import (
 )
 
 
-func NewServer(state *internalState, fidStore store.Singleton) *grpc.Server {
+func NewServer(state *globalState) *grpc.Server {
 	s := grpc.NewServer()
 	pb.RegisterControlServer(s, &RpcServer{
 		state: state,
-		fidStore: fidStore,
 	})
 	// Register reflection service on gRPC server.
 	reflection.Register(s)
@@ -81,8 +78,7 @@ func (m *RpcServer) logMethod() {
 
 // Implements interface pb.ControlServer
 type RpcServer struct {
-	state       *internalState
-	fidStore    store.Singleton
+	state       *globalState
 }
 
 func (*RpcServer) TrackStatus(*pb.StatusRequest, pb.Control_TrackStatusServer) error {
@@ -103,10 +99,10 @@ func (m *RpcServer) GetFrameworkInfo(context.Context, *pb.GetFrameworkInfoReques
 	pat, _ := strconv.ParseInt(product.VERSION_PATCH, 10, 32)
 
 	r := &pb.GetFrameworkInfoReply{
-		FrameworkId:        store.GetIgnoreErrors(m.fidStore)(),
+		FrameworkId:        m.state.taskman.GetFrameworkID(),
 		EnvironmentsCount:  int32(len(m.state.environments.Ids())),
 		TasksCount:         int32(m.state.taskman.TaskCount()),
-		State:              m.state.sm.Current(),
+		State:              m.state.taskman.GetState(),
 		HostsCount:         int32(m.state.taskman.AgentCache.Count()),
 		InstanceName:       viper.GetString("instanceName"),
 		Version:            &pb.Version{
@@ -134,7 +130,7 @@ func (m *RpcServer) GetEnvironments(context.Context, *pb.GetEnvironmentsRequest)
 	defer m.state.RUnlock()
 
 	r := &pb.GetEnvironmentsReply{
-		FrameworkId: store.GetIgnoreErrors(m.fidStore)(),
+		FrameworkId: m.state.taskman.GetFrameworkID(),
 		Environments: make(EnvironmentInfos, 0, 0),
 	}
 	for _, id := range m.state.environments.Ids() {
@@ -178,17 +174,18 @@ func (m *RpcServer) NewEnvironment(cxt context.Context, request *pb.NewEnvironme
 	//    make sure they are now successfully in CONFIGURED
 	// 5) Report back here with the new environment id and error code, if needed.
 
-	if m.state.sm.Cannot("NEW_ENVIRONMENT") {
-		msg := fmt.Sprintf("NEW_ENVIRONMENT transition impossible, current state: %s",
-			m.state.sm.Current())
-		return nil, status.Error(codes.Internal, msg)
-	}
-	err := m.state.sm.Event("NEW_ENVIRONMENT") //Async until Transition call
-	defer m.state.sm.Transition()
-
-	if _, ok := err.(fsm.NoTransitionError); !ok && err != nil {
-		return nil, status.Newf(codes.Internal, "cannot create new environment: %s", err.Error()).Err()
-	}
+	// FIXME: figure out if the state.sm becomes a task.Manager sm, or no global sm at all
+	//if m.state.sm.Cannot("NEW_ENVIRONMENT") {
+	//	msg := fmt.Sprintf("NEW_ENVIRONMENT transition impossible, current state: %s",
+	//		m.state.sm.Current())
+	//	return nil, status.Error(codes.Internal, msg)
+	//}
+	//err := m.state.sm.Event("NEW_ENVIRONMENT") //Async until Transition call
+	//defer m.state.sm.Transition()
+	//
+	//if _, ok := err.(fsm.NoTransitionError); !ok && err != nil {
+	//	return nil, status.Newf(codes.Internal, "cannot create new environment: %s", err.Error()).Err()
+	//}
 
 	// Create new Environment instance with some roles, we get back a UUID
 	id, err := m.state.environments.CreateEnvironment(request.GetWorkflowTemplate(), request.GetVars())
@@ -214,9 +211,9 @@ func (m *RpcServer) NewEnvironment(cxt context.Context, request *pb.NewEnvironme
 		Environment: ei,
 	}
 	select {
-	case m.state.Event <- pb.NewEnvironmentCreatedEvent(ei):
+	case m.state.PublicEvent <- pb.NewEnvironmentCreatedEvent(ei):
 	default:
-		log.Debug("state.Event channel is full")
+		log.Debug("state.PublicEvent channel is full")
 	}
 	return r, nil
 }
@@ -372,9 +369,9 @@ func (m *RpcServer) DestroyEnvironment(cxt context.Context, req *pb.DestroyEnvir
 		return &pb.DestroyEnvironmentReply{CleanupTasksReply: ctr}, status.New(codes.Internal, err.Error()).Err()
 	}
 	select {
-	case m.state.Event <- pb.NewEnvironmentDestroyedEvent(ctr, env.Id().String()):
+	case m.state.PublicEvent <- pb.NewEnvironmentDestroyedEvent(ctr, env.Id().String()):
 	default:
-		log.Debug("state.Event channel is full")
+		log.Debug("state.PublicEvent channel is full")
 	}
 	return &pb.DestroyEnvironmentReply{CleanupTasksReply: ctr}, nil
 }
@@ -659,7 +656,7 @@ func (m *RpcServer) Subscribe(req *pb.SubscribeRequest, srv pb.Control_Subscribe
 	ctx := srv.Context()
 	for {
 		select {
-		case event := <- m.state.Event:
+		case event := <- m.state.PublicEvent:
 			m.state.RLock()
 			err := srv.Send(event)
 			if err != nil {

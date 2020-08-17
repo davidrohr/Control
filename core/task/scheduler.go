@@ -25,28 +25,26 @@
  * Intergovernmental Organization or submit itself to any jurisdiction.
  */
 
-package core
+package task
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/AliceO2Group/Control/common/controlmode"
-	"github.com/AliceO2Group/Control/common/utils"
-	"github.com/AliceO2Group/Control/core/task/channel"
-	"github.com/AliceO2Group/Control/core/workflow"
-	"github.com/spf13/viper"
 	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/AliceO2Group/Control/common/controlmode"
+	"github.com/AliceO2Group/Control/core/task/channel"
+	"github.com/AliceO2Group/Control/core/task/schedutil"
+	"github.com/spf13/viper"
+
 	"github.com/AliceO2Group/Control/common/event"
 	"github.com/AliceO2Group/Control/core/controlcommands"
-	"github.com/AliceO2Group/Control/core/environment"
 	cpb "github.com/AliceO2Group/Control/core/protos"
-	"github.com/AliceO2Group/Control/core/task"
 	"github.com/AliceO2Group/Control/core/task/constraint"
 	"github.com/AliceO2Group/Control/executor/protos"
 	"github.com/gogo/protobuf/proto"
@@ -70,6 +68,7 @@ var (
 	RegistrationMaxBackoff = 15 * time.Second
 )
 
+
 // StateError is returned when the system encounters an unresolvable state transition error and
 // should likely exit.
 type StateError string
@@ -79,7 +78,7 @@ func (err StateError) Error() string { return string(err) }
 var schedEventsCh = make(chan scheduler.Event_Type)
 
 func runSchedulerController(ctx context.Context,
-							state *internalState,
+							state *schedulerState,
 							fidStore store.Singleton) error {
 	// Set up communication from controller to state machine.
 	go func() {
@@ -111,9 +110,9 @@ func runSchedulerController(ctx context.Context,
 	// ID, as well as additional information such as Roles, WebUI URL, etc.
 	return controller.Run(
 		ctx,
-		buildFrameworkInfo(),
+		schedutil.BuildFrameworkInfo(),
 		state.cli, /* controller.Option...: */
-		controller.WithEventHandler(buildEventHandler(state, fidStore)),
+		controller.WithEventHandler(state.buildEventHandler(fidStore)),
 		controller.WithFrameworkID(store.GetIgnoreErrors(fidStore)),
 		controller.WithRegistrationTokens(
 			// Limit the rate of reregistration.
@@ -142,7 +141,7 @@ func runSchedulerController(ctx context.Context,
 // buildEventHandler generates and returns a handler to process events received
 // from the subscription. The handler is then passed as controller.Option to
 // controller.Run.
-func buildEventHandler(state *internalState, fidStore store.Singleton) events.Handler {
+func (state *schedulerState) buildEventHandler(fidStore store.Singleton) events.Handler {
 	// disable brief logs when verbose logs are enabled (there's no sense logging twice!)
 	logger := controller.LogEvents(nil).Unless(viper.GetBool("verbose"))
 
@@ -150,25 +149,25 @@ func buildEventHandler(state *internalState, fidStore store.Singleton) events.Ha
 		logAllEvents().If(viper.GetBool("verbose")),
 		eventMetrics(state.metricsAPI, time.Now, viper.GetBool("summaryMetrics")),
 		controller.LiftErrors().DropOnError(),
-		eventrules.HandleF(notifyStateMachine(state)),
+		eventrules.HandleF(state.notifyStateMachine()),
 	).Handle(events.Handlers{
 		// scheduler.Event_Type: events.Handler
 		scheduler.Event_FAILURE: logger.HandleF(failure), // wrapper + print error
-		scheduler.Event_OFFERS:  trackOffersReceived(state).HandleF(resourceOffers(state, fidStore)),
-		scheduler.Event_UPDATE:  controller.AckStatusUpdates(state.cli).AndThen().HandleF(statusUpdate(state)),
+		scheduler.Event_OFFERS:  state.trackOffersReceived().HandleF(state.resourceOffers(fidStore)),
+		scheduler.Event_UPDATE:  controller.AckStatusUpdates(state.cli).AndThen().HandleF(state.statusUpdate()),
 		scheduler.Event_SUBSCRIBED: eventrules.New(
 			logger,
 			controller.TrackSubscription(fidStore, viper.GetDuration("mesosFailoverTimeout")),
-			eventrules.New().HandleF(reconciliationCall(state)),
+			eventrules.New().HandleF(state.reconciliationCall()),
 		),
-		scheduler.Event_MESSAGE: eventrules.HandleF(incomingMessageHandler(state, fidStore)),
+		scheduler.Event_MESSAGE: eventrules.HandleF(state.incomingMessageHandler()),
 	}.Otherwise(logger.HandleEvent))
 }
 
 
 // Channel the event type of the newly received event to an asynchronous dispatcher
 // in runSchedulerController
-func notifyStateMachine(state *internalState) events.HandlerFunc {
+func (state *schedulerState) notifyStateMachine() events.HandlerFunc {
 	return func(ctx context.Context, e *scheduler.Event) error {
 		schedEventsCh <- e.GetType()
 		return nil
@@ -177,16 +176,16 @@ func notifyStateMachine(state *internalState) events.HandlerFunc {
 
 // Implicit Reconciliation Call that sends an empty list of tasks and the master responds 
 // with the latest state for all currently known non-terminal tasks.
-func reconciliationCall(state *internalState) events.HandlerFunc {
+func (state *schedulerState) reconciliationCall() events.HandlerFunc {
 	return func(ctx context.Context, e *scheduler.Event) error {
 		reconcileCall := calls.Reconcile(calls.ReconcileTasks(nil))
-		calls.CallNoData(ctx, state.cli, reconcileCall)
+		_ = calls.CallNoData(ctx, state.cli, reconcileCall)
 		return nil
 	}
 }
 
 // Update metrics when we receive an offer
-func trackOffersReceived(state *internalState) eventrules.Rule {
+func (state *schedulerState)trackOffersReceived() eventrules.Rule {
 	return func(ctx context.Context, e *scheduler.Event, err error, chain eventrules.Chain) (context.Context, *scheduler.Event, error) {
 		if err == nil {
 			state.metricsAPI.offersReceived.Int(len(e.GetOffers().GetOffers()))
@@ -222,10 +221,10 @@ func failure(_ context.Context, e *scheduler.Event) error {
 }
 
 // Handler for Event_MESSAGE
-func incomingMessageHandler(state *internalState, fidStore store.Singleton) events.HandlerFunc {
+func (state *schedulerState) incomingMessageHandler() events.HandlerFunc {
 	// instantiate map of MCtargets, command IDs and timeouts here
 	// what should happen
-	// SendCommand sends a command, pushes the targets list, command id and timeout (maybe
+	// sendCommand sends a command, pushes the targets list, command id and timeout (maybe
 	// through a channel) to a structure accessible here.
 	// then when we receive a response, if its id, target and timeout is satisfied by one and
 	// only one entry in the list, we signal back to commandqueue
@@ -282,7 +281,8 @@ func incomingMessageHandler(state *internalState, fidStore store.Singleton) even
 				if err != nil {
 					return
 				}
-				handleDeviceEvent(state, ev)
+				state.taskman.internalEventCh <- ev
+				//state.handleDeviceEvent(ev)
 			} else {
 				log.WithFields(logrus.Fields{
 						"type": incomingEvent.Type.String(),
@@ -347,24 +347,24 @@ func incomingMessageHandler(state *internalState, fidStore store.Singleton) even
 				}
 
 				go func() {
-					taskmanMessage := task.NewTaskStateMessage(res.TaskId, res.CurrentState)
+					taskmanMessage := NewTaskStateMessage(res.TaskId, res.CurrentState)
 					state.taskman.MessageChannel <-taskmanMessage
 
 					// servent should be inside taskman and eventually
 					// all this handling.
 					state.servent.ProcessResponse(&res, sender)
 					select {
-					case state.Event <- cpb.NewEventTaskState(res.TaskId, res.CurrentState):
+					case state.taskman.publicEventCh <- cpb.NewEventTaskState(res.TaskId, res.CurrentState):
 					default:
-						log.Debug("state.Event channel is full")
+						log.Debug("state.PublicEvent channel is full")
 					}
 				}()
 				return
 			default:
 				return errors.New(fmt.Sprintf("unrecognized response for controlcommand %s", incomingCommand.CommandName))
 			}
-		case "TaskMessage":
-			var taskMessage event.TaskMessageBase
+		case "AnnounceTaskPIDEvent":
+			var taskMessage event.AnnounceTaskPIDEvent
 			err = json.Unmarshal(data, &taskMessage)
 			if err != nil {
 				return
@@ -379,90 +379,8 @@ func incomingMessageHandler(state *internalState, fidStore store.Singleton) even
 	}
 }
 
-func handleDeviceEvent(state *internalState, evt event.DeviceEvent) {
-	if evt == nil {
-		log.WithPrefix("scheduler").Error("cannot handle null DeviceEvent")
-		return
-	}
-
-	switch evt.GetType() {
-	case pb.DeviceEventType_BASIC_TASK_TERMINATED:
-		if btt, ok := evt.(*event.BasicTaskTerminated); ok {
-			log.WithPrefix("scheduler").
-				WithFields(logrus.Fields{
-					"exitCode": btt.ExitCode,
-					"stdout": btt.Stdout,
-					"stderr": btt.Stderr,
-					"finalMesosState": btt.FinalMesosState.String(),
-				}).
-				Info("basic task terminated")
-
-			// Propagate this information to the task/role
-			taskId := evt.GetOrigin().TaskId
-			t := state.taskman.GetTask(taskId.Value)
-			isHook := false
-			if t != nil {
-				if parentRole, ok := t.GetParentRole().(workflow.Role); ok {
-					parentRole.SetRuntimeVars(map[string]string{
-						"taskResult.exitCode": strconv.Itoa(btt.ExitCode),
-						"taskResult.stdout": btt.Stdout,
-						"taskResult.stderr": btt.Stderr,
-						"taskResult.finalStatus": btt.FinalMesosState.String(),
-						"taskResult.timestamp": utils.NewUnixTimestamp(),
-					})
-
-					// If it's an update following a HOOK execution
-					if t.GetControlMode() == controlmode.HOOK {
-						isHook = true
-						env, err := state.environments.Environment(t.GetEnvironmentId().UUID())
-						if err != nil {
-							log.WithPrefix("scheduler").WithError(err).Error("cannot find environment for DeviceEvent")
-						}
-						env.NotifyEvent(evt)
-					}
-				} else {
-					log.WithPrefix("scheduler").Error("DeviceEvent BASIC_TASK_TERMINATED received for task with no parent role")
-				}
-			} else {
-				log.WithPrefix("scheduler").Error("cannot find task for DeviceEvent BASIC_TASK_TERMINATED")
-			}
-
-			// If the task hasn't already been killed
-			// AND it's not a hook
-			if !isHook {
-				goto doFallthrough
-			}
-		}
-		return
-	doFallthrough:
-		fallthrough
-	case pb.DeviceEventType_END_OF_STREAM:
-		taskId := evt.GetOrigin().TaskId
-		t := state.taskman.GetTask(taskId.Value)
-		if t == nil {
-			log.WithPrefix("scheduler").Error("cannot find task for DeviceEvent END_OF_STREAM")
-			return
-		}
-		env, err := state.environments.Environment(t.GetEnvironmentId().UUID())
-		if err != nil {
-			log.WithPrefix("scheduler").WithError(err).Error("cannot find environment for DeviceEvent")
-		}
-		if env.CurrentState() == "RUNNING" {
-			t.SetSafeToStop(true) // we mark this specific task as ok to STOP
-			go func() {
-				if env.IsSafeToStop() {     // but then we ask the env whether *all* of them are
-					err = env.TryTransition(environment.NewStopActivityTransition(state.taskman))
-					if err != nil {
-						log.WithPrefix("scheduler").WithError(err).Error("cannot stop run after END_OF_STREAM event")
-					}
-				}
-			}()
-		}
-	}
-}
-
 // Handler for Event_OFFERS
-func resourceOffers(state *internalState, fidStore store.Singleton) events.HandlerFunc {
+func (state *schedulerState) resourceOffers(fidStore store.Singleton) events.HandlerFunc {
 	return func(ctx context.Context, e *scheduler.Event) error {
 		var (
 			offers                 = e.GetOffers().GetOffers()
@@ -487,7 +405,7 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 			}).Trace("received offers")
 		}
 
-		var descriptorsToDeploy task.Descriptors
+		var descriptorsToDeploy Descriptors
 		select {
 		case descriptorsToDeploy = <- state.tasksToDeploy:
 			if viper.GetBool("veryVerbose") {
@@ -516,7 +434,7 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 			offerIDsToDecline[offers[i].ID] = struct{}{}
 		}
 
-		tasksDeployed := make(task.DeploymentMap)
+		tasksDeployed := make(DeploymentMap)
 
 		if len(descriptorsToDeploy) > 0 {
 			// 3 ways to make decisions
@@ -541,7 +459,7 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 				var (
 					remainingResources = mesos.Resources(offer.Resources)
 					tasks = make([]mesos.TaskInfo, 0)
-					tasksDeployedForCurrentOffer = make(task.DeploymentMap)
+					tasksDeployedForCurrentOffer = make(DeploymentMap)
 					targetExecutorId = mesos.ExecutorID{}
 				)
 
@@ -602,7 +520,7 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 							Warning("no resource demands for descriptor, invalid class perhaps?")
 						continue
 					}
-					if !task.Resources(remainingResources).Satisfy(wants) {
+					if !Resources(remainingResources).Satisfy(wants) {
 						if viper.GetBool("veryVerbose") {
 							log.WithPrefix("scheduler").
 								WithFields(logrus.Fields{
@@ -638,7 +556,7 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 						}
 					}
 
-					agentForCache := task.AgentCacheInfo{
+					agentForCache := AgentCacheInfo{
 						AgentId: offer.AgentID,
 						Attributes: offer.Attributes,
 						Hostname: offer.Hostname,
@@ -743,9 +661,9 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 						Debug("creating Mesos task")
 					resourcesRequest.Add(executorResources...)
 					select {
-					case state.Event <- cpb.NewEventMesosTaskCreated(resourcesRequest.String(), executorResources.String()):
+					case state.taskman.publicEventCh <- cpb.NewEventMesosTaskCreated(resourcesRequest.String(), executorResources.String()):
 					default:
-						log.Debug("state.Event channel is full")
+						log.Debug("state.PublicEvent channel is full")
 					}
 
 					newTaskId := taskPtr.GetTaskId()
@@ -783,9 +701,9 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 						"task":       mesosTaskInfo,
 					}).Debug("launching task")
 					select {
-					case state.Event <- cpb.NewEventTaskLaunch(newTaskId):
+					case state.taskman.publicEventCh <- cpb.NewEventTaskLaunch(newTaskId):
 					default:
-						log.Debug("state.Event channel is full")
+						log.Debug("state.PublicEvent channel is full")
 					}
 
 					tasks = append(tasks, mesosTaskInfo)
@@ -887,7 +805,7 @@ func resourceOffers(state *internalState, fidStore store.Singleton) events.Handl
 
 // statusUpdate handles an incoming UPDATE event.
 // This func runs after acknowledgement.
-func statusUpdate(state *internalState) events.HandlerFunc {
+func (state *schedulerState) statusUpdate() events.HandlerFunc {
 	return func(ctx context.Context, e *scheduler.Event) error {
 		s := e.GetUpdate().GetStatus()
 		if viper.GetBool("verbose") {
@@ -912,12 +830,12 @@ func statusUpdate(state *internalState) events.HandlerFunc {
 				log.Println("Mission accomplished, all tasks completed. Terminating scheduler.")
 				state.shutdown()
 			} else {
-				tryReviveOffers(ctx, state)
+				state.tryReviveOffers(ctx)
 			}*/
 			// log.WithPrefix("scheduler").Debug("state unlock")
 		}
 
-		taskmanMessage := task.NewTaskStatusMessage(s)
+		taskmanMessage := NewTaskStatusMessage(s)
 		state.taskman.MessageChannel <- taskmanMessage
 
 
@@ -929,7 +847,7 @@ func statusUpdate(state *internalState) events.HandlerFunc {
 // have set through ACCEPT or DECLINE calls, in the hope that Mesos then sends us new resource offers.
 // This should generally run when we have received a TASK_FINISHED for some tasks, and we have more
 // tasks to run.
-func tryReviveOffers(ctx context.Context, state *internalState) {
+func (state *schedulerState) tryReviveOffers(ctx context.Context) {
 	// limit the rate at which we request offer revival
 	select {
 	case <-state.reviveTokens:
@@ -940,7 +858,7 @@ func tryReviveOffers(ctx context.Context, state *internalState) {
 	}
 }
 
-func doReviveOffers(ctx context.Context, state *internalState) {
+func doReviveOffers(ctx context.Context, state *schedulerState) {
 	err := calls.CallNoData(ctx, state.cli, calls.Revive())
 	if err != nil {
 		log.WithPrefix("scheduler").WithField("error", err.Error()).
@@ -950,21 +868,21 @@ func doReviveOffers(ctx context.Context, state *internalState) {
 	log.WithPrefix("scheduler").Debug("revive offers done")
 }
 
-func KillTask(ctx context.Context, state *internalState, receiver controlcommands.MesosCommandTarget) (err error) {
+func (state *schedulerState) killTask(ctx context.Context, receiver controlcommands.MesosCommandTarget) (err error) {
 	killCall := calls.Kill(receiver.TaskId.GetValue(), receiver.AgentId.GetValue())
 
 	err = calls.CallNoData(ctx, state.cli, killCall)
 	select {
-	case state.Event <- cpb.NewKillTasksEvent():
+	case state.taskman.publicEventCh <- cpb.NewKillTasksEvent():
 	default:
-		log.Debug("state.Event channel is full")
+		log.Debug("state.PublicEvent channel is full")
 	}
 	return
 }
 
-func SendCommand(ctx context.Context, state *internalState, command controlcommands.MesosCommand, receiver controlcommands.MesosCommandTarget) (err error) {
-	log.Debug("SendCommand BEGIN")
-	defer log.Debug("SendCommand END")
+func (state *schedulerState) sendCommand(ctx context.Context, command controlcommands.MesosCommand, receiver controlcommands.MesosCommandTarget) (err error) {
+	log.Debug("sendCommand BEGIN")
+	defer log.Debug("sendCommand END")
 	var bytes []byte
 	bytes, err = json.Marshal(command)
 	if err != nil {
@@ -984,9 +902,9 @@ func SendCommand(ctx context.Context, state *internalState, command controlcomma
 	}).
 	Debug("outgoing MESSAGE call")
 	select {
-	case state.Event <- cpb.NewEnvironmentStateEvent(bytes):
+	case state.taskman.publicEventCh <- cpb.NewEnvironmentStateEvent(bytes):
 	default:
-		log.Debug("state.Event channel is full")
+		log.Debug("state.PublicEvent channel is full")
 	}
 	return err
 }
